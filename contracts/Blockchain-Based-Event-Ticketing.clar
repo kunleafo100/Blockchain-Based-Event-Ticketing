@@ -13,6 +13,11 @@
 (define-constant err-invalid-price (err u109))
 (define-constant err-event-cancelled (err u110))
 
+(define-constant reputation-cancelled-penalty u20)
+(define-constant reputation-completed-bonus u10)
+(define-constant reputation-base-score u100)
+
+
 (define-data-var ticket-id-nonce uint u1)
 
 (define-map events 
@@ -288,6 +293,78 @@
     (try! (as-contract (stx-transfer? (get purchase-price ticket-data) tx-sender (get current-owner ticket-data))))
     (try! (nft-burn? event-ticket ticket-id (get current-owner ticket-data))) 
     (map-delete tickets { ticket-id: ticket-id })
+    (ok true)
+  )
+)
+
+(define-map organizer-reputation
+  { organizer: principal }
+  {
+    total-events: uint,
+    completed-events: uint,
+    cancelled-events: uint,
+    reputation-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-read-only (get-organizer-reputation (organizer principal))
+  (default-to 
+    {
+      total-events: u0,
+      completed-events: u0,
+      cancelled-events: u0,
+      reputation-score: reputation-base-score,
+      last-updated: u0
+    }
+    (map-get? organizer-reputation { organizer: organizer })
+  )
+)
+
+(define-read-only (calculate-reputation-score (completed uint) (cancelled uint) (total uint))
+  (if (is-eq total u0)
+    reputation-base-score
+    (let (
+      (completion-rate (/ (* completed u100) total))
+      (cancellation-penalty (* cancelled reputation-cancelled-penalty))
+      (completion-bonus (* completed reputation-completed-bonus))
+    )
+      (if (>= (+ reputation-base-score completion-bonus) cancellation-penalty)
+        (- (+ reputation-base-score completion-bonus) cancellation-penalty)
+        u0
+      )
+    )
+  )
+)
+
+(define-private (update-organizer-reputation (organizer principal) (event-completed bool) (event-cancelled bool))
+  (let (
+    (current-rep (get-organizer-reputation organizer))
+    (new-total (+ (get total-events current-rep) u1))
+    (new-completed (if event-completed (+ (get completed-events current-rep) u1) (get completed-events current-rep)))
+    (new-cancelled (if event-cancelled (+ (get cancelled-events current-rep) u1) (get cancelled-events current-rep)))
+    (new-score (calculate-reputation-score new-completed new-cancelled new-total))
+  )
+    (map-set organizer-reputation
+      { organizer: organizer }
+      {
+        total-events: new-total,
+        completed-events: new-completed,
+        cancelled-events: new-cancelled,
+        reputation-score: new-score,
+        last-updated: stacks-block-height
+      }
+    )
+  )
+)
+
+(define-public (finalize-event (event-id uint))
+  (let ((event-data (unwrap! (get-event event-id) err-event-not-found)))
+    (asserts! (is-eq tx-sender (get organizer event-data)) err-owner-only)
+    (asserts! (not (get is-cancelled event-data)) err-event-cancelled)
+    (asserts! (> stacks-block-height (get end-time event-data)) err-event-expired)
+    
+    (update-organizer-reputation (get organizer event-data) true false)
     (ok true)
   )
 )
