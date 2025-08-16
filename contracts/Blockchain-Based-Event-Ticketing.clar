@@ -17,6 +17,10 @@
 (define-constant reputation-completed-bonus u10)
 (define-constant reputation-base-score u100)
 
+(define-constant err-discount-not-found (err u111))
+(define-constant err-discount-expired (err u112))
+(define-constant err-discount-used-up (err u113))
+(define-constant err-invalid-discount-code (err u114))
 
 (define-data-var ticket-id-nonce uint u1)
 
@@ -366,5 +370,96 @@
     
     (update-organizer-reputation (get organizer event-data) true false)
     (ok true)
+  )
+)
+
+
+
+(define-map discount-codes
+  { event-id: uint, code: (string-ascii 20) }
+  {
+    discount-percent: uint,
+    max-uses: uint,
+    current-uses: uint,
+    expiry-block: uint,
+    is-active: bool
+  }
+)
+
+(define-read-only (get-discount-code (event-id uint) (code (string-ascii 20)))
+  (map-get? discount-codes { event-id: event-id, code: code })
+)
+
+(define-public (create-discount-code 
+  (event-id uint) 
+  (code (string-ascii 20)) 
+  (discount-percent uint) 
+  (max-uses uint) 
+  (expiry-block uint)
+)
+  (let ((event-data (unwrap! (get-event event-id) err-event-not-found)))
+    (asserts! (is-eq tx-sender (get organizer event-data)) err-owner-only)
+    (asserts! (< discount-percent u100) err-invalid-price)
+    (asserts! (> max-uses u0) err-invalid-price)
+    (asserts! (> expiry-block stacks-block-height) err-event-expired)
+    (asserts! (< expiry-block (get start-time event-data)) err-event-expired)
+    
+    (map-set discount-codes
+      { event-id: event-id, code: code }
+      {
+        discount-percent: discount-percent,
+        max-uses: max-uses,
+        current-uses: u0,
+        expiry-block: expiry-block,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (buy-ticket-with-discount (event-id uint) (discount-code (string-ascii 20)))
+  (let (
+    (event-data (unwrap! (get-event event-id) err-event-not-found))
+    (discount-data (unwrap! (get-discount-code event-id discount-code) err-discount-not-found))
+    (ticket-id (var-get ticket-id-nonce))
+    (discounted-price (- (get ticket-price event-data) 
+                        (/ (* (get ticket-price event-data) (get discount-percent discount-data)) u100)))
+  )
+    (asserts! (not (get is-cancelled event-data)) err-event-cancelled)
+    (asserts! (< stacks-block-height (get start-time event-data)) err-event-expired)
+    (asserts! (< (get tickets-sold event-data) (get max-tickets event-data)) err-insufficient-payment)
+    (asserts! (get is-active discount-data) err-invalid-discount-code)
+    (asserts! (< stacks-block-height (get expiry-block discount-data)) err-discount-expired)
+    (asserts! (< (get current-uses discount-data) (get max-uses discount-data)) err-discount-used-up)
+    
+    (try! (stx-transfer? discounted-price tx-sender (get organizer event-data)))
+    (try! (nft-mint? event-ticket ticket-id tx-sender))
+    
+    (map-set tickets
+      { ticket-id: ticket-id }
+      {
+        event-id: event-id,
+        original-owner: tx-sender,
+        current-owner: tx-sender,
+        purchase-price: discounted-price,
+        resale-count: u0,
+        is-used: false,
+        purchase-block: stacks-block-height
+      }
+    )
+    
+    (map-set events
+      { event-id: event-id }
+      (merge event-data { tickets-sold: (+ (get tickets-sold event-data) u1) })
+    )
+    
+    (map-set discount-codes
+      { event-id: event-id, code: discount-code }
+      (merge discount-data { current-uses: (+ (get current-uses discount-data) u1) })
+    )
+    
+    (var-set ticket-id-nonce (+ ticket-id u1))
+    (ok ticket-id)
   )
 )
