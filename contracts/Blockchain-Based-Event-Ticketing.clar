@@ -22,6 +22,11 @@
 (define-constant err-discount-used-up (err u113))
 (define-constant err-invalid-discount-code (err u114))
 
+(define-constant err-insufficient-rewards (err u115))
+(define-constant err-reward-already-claimed (err u116))
+(define-constant default-attendance-reward u50)
+(define-constant default-premium-reward u100)
+
 (define-data-var ticket-id-nonce uint u1)
 
 (define-map events 
@@ -461,5 +466,126 @@
     
     (var-set ticket-id-nonce (+ ticket-id u1))
     (ok ticket-id)
+  )
+)
+
+
+(define-map attendee-rewards
+  { attendee: principal }
+  {
+    total-points: uint,
+    events-attended: uint,
+    last-updated: uint
+  }
+)
+
+(define-map event-reward-claims
+  { ticket-id: uint }
+  {
+    claimed: bool,
+    reward-amount: uint,
+    claim-block: uint
+  }
+)
+
+(define-read-only (get-attendee-rewards (attendee principal))
+  (default-to 
+    { total-points: u0, events-attended: u0, last-updated: u0 }
+    (map-get? attendee-rewards { attendee: attendee })
+  )
+)
+
+(define-read-only (get-reward-claim-status (ticket-id uint))
+  (map-get? event-reward-claims { ticket-id: ticket-id })
+)
+
+(define-read-only (calculate-event-reward (ticket-price uint))
+  (if (>= ticket-price u5000000)
+    default-premium-reward
+    default-attendance-reward
+  )
+)
+
+(define-public (claim-attendance-reward (ticket-id uint))
+  (let (
+    (ticket-data (unwrap! (get-ticket ticket-id) err-not-token-owner))
+    (event-data (unwrap! (get-event (get event-id ticket-data)) err-event-not-found))
+    (current-rewards (get-attendee-rewards (get current-owner ticket-data)))
+    (reward-amount (calculate-event-reward (get purchase-price ticket-data)))
+  )
+    (asserts! (is-eq tx-sender (get current-owner ticket-data)) err-not-token-owner)
+    (asserts! (get is-used ticket-data) err-ticket-already-used)
+    (asserts! (is-none (get-reward-claim-status ticket-id)) err-reward-already-claimed)
+    (asserts! (> stacks-block-height (get end-time event-data)) err-event-expired)
+    
+    (map-set attendee-rewards
+      { attendee: (get current-owner ticket-data) }
+      {
+        total-points: (+ (get total-points current-rewards) reward-amount),
+        events-attended: (+ (get events-attended current-rewards) u1),
+        last-updated: stacks-block-height
+      }
+    )
+    
+    (map-set event-reward-claims
+      { ticket-id: ticket-id }
+      {
+        claimed: true,
+        reward-amount: reward-amount,
+        claim-block: stacks-block-height
+      }
+    )
+    (ok reward-amount)
+  )
+)
+
+(define-public (redeem-rewards-for-discount (event-id uint) (points-to-redeem uint))
+  (let (
+    (event-data (unwrap! (get-event event-id) err-event-not-found))
+    (current-rewards (get-attendee-rewards tx-sender))
+    (discount-percent (/ points-to-redeem u10))
+    (max-discount u50)
+    (final-discount (if (> discount-percent max-discount) max-discount discount-percent))
+    (ticket-id (var-get ticket-id-nonce))
+    (discounted-price (- (get ticket-price event-data) 
+                        (/ (* (get ticket-price event-data) final-discount) u100)))
+  )
+    (asserts! (not (get is-cancelled event-data)) err-event-cancelled)
+    (asserts! (< stacks-block-height (get start-time event-data)) err-event-expired)
+    (asserts! (< (get tickets-sold event-data) (get max-tickets event-data)) err-insufficient-payment)
+    (asserts! (>= (get total-points current-rewards) points-to-redeem) err-insufficient-rewards)
+    (asserts! (> points-to-redeem u0) err-invalid-price)
+    
+    (try! (stx-transfer? discounted-price tx-sender (get organizer event-data)))
+    (try! (nft-mint? event-ticket ticket-id tx-sender))
+    
+    (map-set tickets
+      { ticket-id: ticket-id }
+      {
+        event-id: event-id,
+        original-owner: tx-sender,
+        current-owner: tx-sender,
+        purchase-price: discounted-price,
+        resale-count: u0,
+        is-used: false,
+        purchase-block: stacks-block-height
+      }
+    )
+    
+    (map-set events
+      { event-id: event-id }
+      (merge event-data { tickets-sold: (+ (get tickets-sold event-data) u1) })
+    )
+    
+    (map-set attendee-rewards
+      { attendee: tx-sender }
+      (merge current-rewards { 
+        total-points: (- (get total-points current-rewards) points-to-redeem),
+        last-updated: stacks-block-height
+      })
+    )
+    
+    (var-set ticket-id-nonce (+ ticket-id u1))
+    (ok { ticket-id: ticket-id, discount-applied: final-discount })
   )
 )
