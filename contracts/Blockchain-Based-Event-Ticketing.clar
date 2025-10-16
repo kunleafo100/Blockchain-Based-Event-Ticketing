@@ -27,6 +27,10 @@
 (define-constant default-attendance-reward u50)
 (define-constant default-premium-reward u100)
 
+(define-constant err-tier-not-found (err u117))
+(define-constant err-tier-sold-out (err u118))
+(define-constant err-invalid-tier-config (err u119))
+
 (define-data-var ticket-id-nonce uint u1)
 
 (define-map events 
@@ -587,5 +591,100 @@
     
     (var-set ticket-id-nonce (+ ticket-id u1))
     (ok { ticket-id: ticket-id, discount-applied: final-discount })
+  )
+)
+
+
+(define-map event-tiers
+  { event-id: uint, tier-id: uint }
+  {
+    tier-name: (string-ascii 50),
+    tier-price: uint,
+    max-tier-tickets: uint,
+    tier-tickets-sold: uint,
+    tier-active: bool
+  }
+)
+
+(define-map ticket-tier-info
+  { ticket-id: uint }
+  { tier-id: uint }
+)
+
+(define-read-only (get-event-tier (event-id uint) (tier-id uint))
+  (map-get? event-tiers { event-id: event-id, tier-id: tier-id })
+)
+
+(define-read-only (get-ticket-tier (ticket-id uint))
+  (map-get? ticket-tier-info { ticket-id: ticket-id })
+)
+
+(define-public (create-event-tier
+  (event-id uint)
+  (tier-id uint)
+  (tier-name (string-ascii 50))
+  (tier-price uint)
+  (max-tier-tickets uint)
+)
+  (let ((event-data (unwrap! (get-event event-id) err-event-not-found)))
+    (asserts! (is-eq tx-sender (get organizer event-data)) err-owner-only)
+    (asserts! (not (get is-cancelled event-data)) err-event-cancelled)
+    (asserts! (< stacks-block-height (get start-time event-data)) err-event-expired)
+    (asserts! (> tier-price u0) err-invalid-price)
+    (asserts! (> max-tier-tickets u0) err-invalid-tier-config)
+    
+    (map-set event-tiers
+      { event-id: event-id, tier-id: tier-id }
+      {
+        tier-name: tier-name,
+        tier-price: tier-price,
+        max-tier-tickets: max-tier-tickets,
+        tier-tickets-sold: u0,
+        tier-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (buy-tiered-ticket (event-id uint) (tier-id uint))
+  (let (
+    (event-data (unwrap! (get-event event-id) err-event-not-found))
+    (tier-data (unwrap! (get-event-tier event-id tier-id) err-tier-not-found))
+    (ticket-id (var-get ticket-id-nonce))
+  )
+    (asserts! (not (get is-cancelled event-data)) err-event-cancelled)
+    (asserts! (< stacks-block-height (get start-time event-data)) err-event-expired)
+    (asserts! (get tier-active tier-data) err-tier-not-found)
+    (asserts! (< (get tier-tickets-sold tier-data) (get max-tier-tickets tier-data)) err-tier-sold-out)
+    
+    (try! (stx-transfer? (get tier-price tier-data) tx-sender (get organizer event-data)))
+    (try! (nft-mint? event-ticket ticket-id tx-sender))
+    
+    (map-set tickets
+      { ticket-id: ticket-id }
+      {
+        event-id: event-id,
+        original-owner: tx-sender,
+        current-owner: tx-sender,
+        purchase-price: (get tier-price tier-data),
+        resale-count: u0,
+        is-used: false,
+        purchase-block: stacks-block-height
+      }
+    )
+    
+    (map-set ticket-tier-info
+      { ticket-id: ticket-id }
+      { tier-id: tier-id }
+    )
+    
+    (map-set event-tiers
+      { event-id: event-id, tier-id: tier-id }
+      (merge tier-data { tier-tickets-sold: (+ (get tier-tickets-sold tier-data) u1) })
+    )
+    
+    (var-set ticket-id-nonce (+ ticket-id u1))
+    (ok { ticket-id: ticket-id, tier-id: tier-id })
   )
 )
