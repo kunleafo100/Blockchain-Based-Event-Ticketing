@@ -31,6 +31,14 @@
 (define-constant err-tier-sold-out (err u118))
 (define-constant err-invalid-tier-config (err u119))
 
+(define-constant err-escrow-not-found (err u120))
+(define-constant err-escrow-already-active (err u121))
+(define-constant err-escrow-expired (err u122))
+(define-constant err-escrow-not-expired (err u123))
+(define-constant err-unauthorized-resolver (err u124))
+
+(define-data-var escrow-id-nonce uint u1)
+
 (define-data-var ticket-id-nonce uint u1)
 
 (define-map events 
@@ -686,5 +694,117 @@
     
     (var-set ticket-id-nonce (+ ticket-id u1))
     (ok { ticket-id: ticket-id, tier-id: tier-id })
+  )
+)
+
+(define-map ticket-escrows
+  { escrow-id: uint }
+  {
+    buyer: principal,
+    seller: principal,
+    ticket-id: uint,
+    escrow-amount: uint,
+    deadline-block: uint,
+    is-fulfilled: bool,
+    is-cancelled: bool,
+    created-at: uint
+  }
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? ticket-escrows { escrow-id: escrow-id })
+)
+
+(define-public (initiate-escrow (ticket-id uint) (seller principal) (deadline-blocks uint))
+  (let (
+    (ticket-data (unwrap! (get-ticket ticket-id) err-not-token-owner))
+    (event-data (unwrap! (get-event (get event-id ticket-data)) err-event-not-found))
+    (listing-data (unwrap! (get-ticket-listing ticket-id) err-listing-not-found))
+    (escrow-id (var-get escrow-id-nonce))
+    (deadline (+ stacks-block-height deadline-blocks))
+  )
+    (asserts! (is-eq seller (get seller listing-data)) err-not-token-owner)
+    (asserts! (< deadline (get start-time event-data)) err-event-expired)
+    (asserts! (> deadline-blocks u0) err-invalid-price)
+    
+    (try! (stx-transfer? (get price listing-data) tx-sender (as-contract tx-sender)))
+    
+    (map-set ticket-escrows
+      { escrow-id: escrow-id }
+      {
+        buyer: tx-sender,
+        seller: seller,
+        ticket-id: ticket-id,
+        escrow-amount: (get price listing-data),
+        deadline-block: deadline,
+        is-fulfilled: false,
+        is-cancelled: false,
+        created-at: stacks-block-height
+      }
+    )
+    (var-set escrow-id-nonce (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-public (fulfill-escrow (escrow-id uint))
+  (let (
+    (escrow-data (unwrap! (get-escrow escrow-id) err-escrow-not-found))
+    (ticket-data (unwrap! (get-ticket (get ticket-id escrow-data)) err-not-token-owner))
+    (event-data (unwrap! (get-event (get event-id ticket-data)) err-event-not-found))
+    (royalty-amount (/ (* (get escrow-amount escrow-data) (get resale-royalty-percent event-data)) u100))
+    (seller-amount (- (get escrow-amount escrow-data) royalty-amount))
+  )
+    (asserts! (is-eq tx-sender (get seller escrow-data)) err-not-token-owner)
+    (asserts! (not (get is-fulfilled escrow-data)) err-escrow-already-active)
+    (asserts! (not (get is-cancelled escrow-data)) err-escrow-already-active)
+    (asserts! (<= stacks-block-height (get deadline-block escrow-data)) err-escrow-expired)
+    
+    (try! (as-contract (stx-transfer? seller-amount tx-sender (get seller escrow-data))))
+    (try! (as-contract (stx-transfer? royalty-amount tx-sender (get organizer event-data))))
+    (try! (nft-transfer? event-ticket (get ticket-id escrow-data) (get current-owner ticket-data) (get buyer escrow-data)))
+    
+    (map-set tickets
+      { ticket-id: (get ticket-id escrow-data) }
+      (merge ticket-data {
+        current-owner: (get buyer escrow-data),
+        resale-count: (+ (get resale-count ticket-data) u1)
+      })
+    )
+    (map-delete ticket-listings { ticket-id: (get ticket-id escrow-data) })
+    (map-set ticket-escrows { escrow-id: escrow-id } (merge escrow-data { is-fulfilled: true }))
+    (ok true)
+  )
+)
+
+(define-public (cancel-escrow (escrow-id uint))
+  (let ((escrow-data (unwrap! (get-escrow escrow-id) err-escrow-not-found)))
+    (asserts! (is-eq tx-sender (get buyer escrow-data)) err-not-token-owner)
+    (asserts! (not (get is-fulfilled escrow-data)) err-escrow-already-active)
+    (asserts! (not (get is-cancelled escrow-data)) err-escrow-already-active)
+    (asserts! (> stacks-block-height (get deadline-block escrow-data)) err-escrow-not-expired)
+    
+    (try! (as-contract (stx-transfer? (get escrow-amount escrow-data) tx-sender (get buyer escrow-data))))
+    (map-set ticket-escrows { escrow-id: escrow-id } (merge escrow-data { is-cancelled: true }))
+    (ok true)
+  )
+)
+
+(define-public (resolve-escrow-dispute (escrow-id uint) (refund-buyer bool))
+  (let (
+    (escrow-data (unwrap! (get-escrow escrow-id) err-escrow-not-found))
+    (ticket-data (unwrap! (get-ticket (get ticket-id escrow-data)) err-not-token-owner))
+    (event-data (unwrap! (get-event (get event-id ticket-data)) err-event-not-found))
+  )
+    (asserts! (is-eq tx-sender (get organizer event-data)) err-unauthorized-resolver)
+    (asserts! (not (get is-fulfilled escrow-data)) err-escrow-already-active)
+    (asserts! (not (get is-cancelled escrow-data)) err-escrow-already-active)
+    
+    (if refund-buyer
+      (try! (as-contract (stx-transfer? (get escrow-amount escrow-data) tx-sender (get buyer escrow-data))))
+      (try! (as-contract (stx-transfer? (get escrow-amount escrow-data) tx-sender (get seller escrow-data))))
+    )
+    (map-set ticket-escrows { escrow-id: escrow-id } (merge escrow-data { is-cancelled: true }))
+    (ok true)
   )
 )
